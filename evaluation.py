@@ -6,63 +6,58 @@ import torch.nn.functional as F
 import config
 
 
-def focal_loss_with_logits(logits, labels, alpha, gamma):
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import config
+
+
+def focal_loss_with_logits(logits, targets, alpha=0.25, gamma=2.0):
     """
-    logits: (B, K)
-    labels: (B, K) 0/1
-
-    返回逐元素 focal loss (B, K)，尚未做 mask 和平均
-
-    公式：
-      bce = BCEWithLogitsLoss(reduction="none")
-      p   = sigmoid(logits)
-      pt  = p*y + (1-p)*(1-y)
-      focal = alpha * (1-pt)^gamma * bce
+    logits: (N,)
+    targets: (N,) in {0,1}
     """
-    bce = F.binary_cross_entropy_with_logits(
-        logits,
-        labels.float(),
-        reduction="none",
-    )  # (B, K)
-
-    p = torch.sigmoid(logits)  # (B, K)
-    pt = p * labels + (1 - p) * (1 - labels)
-    focal_weight = alpha * (1.0 - pt).pow(gamma)
-
-    loss = focal_weight * bce
-    return loss  # (B, K)
+    bce = F.binary_cross_entropy_with_logits(logits, targets, reduction="none")
+    p   = torch.sigmoid(logits)
+    pt  = torch.where(targets > 0.5, p, 1.0 - p)
+    loss = alpha * (1.0 - pt) ** gamma * bce
+    return loss
 
 
 def compute_loss(logits, labels, sent_mask, loss_type="bce", pos_weight=None):
     """
     logits: (B, K)
     labels: (B, K)
-    sent_mask: (B, K)
-
-    返回标量 loss
+    sent_mask: (B, K)  1=有效，0=padding
     """
+    # 只在有效位置上计算 loss
+    mask = sent_mask > 0.5
+    if mask.sum() == 0:
+        return torch.tensor(0.0, device=logits.device)
+
+    logits_flat = logits[mask]          # (N,)
+    labels_flat = labels[mask].float()  # (N,)
+
     if loss_type == "bce":
+        # 带正类权重的 BCE
         if pos_weight is not None:
-            criterion = nn.BCEWithLogitsLoss(reduction="none", pos_weight=pos_weight)
+            # pos_weight 需要是 tensor
+            loss_fn = nn.BCEWithLogitsLoss(pos_weight=pos_weight)
         else:
-            criterion = nn.BCEWithLogitsLoss(reduction="none")
-        loss_raw = criterion(logits, labels.float())   # (B, K)
+            loss_fn = nn.BCEWithLogitsLoss()
+        loss = loss_fn(logits_flat, labels_flat)
+        return loss
 
     elif loss_type == "focal":
-        alpha = getattr(config, "FOCAL_ALPHA", 0.25)
+        # focal loss：内部不再额外加权，alpha 在 config 里配
+        alpha = getattr(config, "FOCAL_ALPHA", 0.75)
         gamma = getattr(config, "FOCAL_GAMMA", 2.0)
-        loss_raw = focal_loss_with_logits(
-            logits,
-            labels,
-            alpha=alpha,
-            gamma=gamma,
-        )  # (B, K)
+        loss_vec = focal_loss_with_logits(logits_flat, labels_flat, alpha=alpha, gamma=gamma)
+        return loss_vec.mean()
 
     else:
-        raise NotImplementedError("unknown loss_type: %s" % loss_type)
+        raise ValueError(f"Unknown loss_type: {loss_type}")
 
-    loss = (loss_raw * sent_mask).sum() / sent_mask.sum()
-    return loss
 
 
 def compute_stats_at_tau(probs_flat, labels_flat, tau):

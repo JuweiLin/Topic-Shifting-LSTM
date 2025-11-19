@@ -181,7 +181,8 @@ def main():
         weight_decay=config.WEIGHT_DECAY,
     )
 
-    pos_weight = None
+    pos_weight = torch.tensor(config.POS_WEIGHT, device=device)
+
 
     for epoch in range(config.EPOCHS):
         print("=== Epoch", epoch, "===")
