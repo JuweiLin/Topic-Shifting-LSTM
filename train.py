@@ -33,7 +33,7 @@ def train_one_epoch(
     step = 0
 
     optimizer.zero_grad()
-
+    
     for i, batch in enumerate(dataloader):
         input_ids      = batch["input_ids"].to(device)
         attention_mask = batch["attention_mask"].to(device)
@@ -41,11 +41,15 @@ def train_one_epoch(
         sent_mask      = batch["sent_mask"].to(device)
         labels         = batch["labels"].to(device)
 
-        meta = {
-            "roles":    batch["roles"].to(device),
-            "sent_len": batch["sent_len"].to(device),
-            "position": batch["position"].to(device),
-        }
+        meta = {}
+        if isinstance(config.FEATURE_SET, str):
+            feat_names = [x.strip() for x in config.FEATURE_SET.split(",") if x.strip()]
+        else:
+            feat_names = list(config.FEATURE_SET)
+
+        for name in feat_names:
+            if name in batch:
+                meta[name] = batch[name].to(device)
 
         # 句向量 H: (B, K, d_enc_sent)
         H, sent_mask_enc = encoder(input_ids, attention_mask, sent_spans, sent_mask)

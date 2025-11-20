@@ -6,7 +6,15 @@ ENCODER_NAME = "FacebookAI/roberta-base"
 UNFREEZE_TOP = 8
 
 BACKBONE = "rnn"
-FEATURE_SET = "none"
+FEATURE_SET = [
+    "roles",
+    "sent_len",
+    "position",
+    "is_question",
+    "has_marker",
+    "speaker_switch",
+    "time_shift",
+]
 
 BATCH_SIZE_DIALOG = 8
 LR_ENC = 1e-5
@@ -18,7 +26,7 @@ SEED = 42
 LOSS_TYPE = "bce"
 GRAD_ACCUM_STEPS = 1
 
-POS_WEIGHT = 2.5
+POS_WEIGHT = 4.5
 
 FOCAL_ALPHA = 0.25      # 正类权重，常见 0.25 / 0.5
 FOCAL_GAMMA = 2.0       # focusing 参数，常见 2.0
