@@ -6,17 +6,7 @@ import torch.nn.functional as F
 import config
 
 
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
-import config
-
-
 def focal_loss_with_logits(logits, targets, alpha=0.25, gamma=2.0):
-    """
-    logits: (N,)
-    targets: (N,) in {0,1}
-    """
     bce = F.binary_cross_entropy_with_logits(logits, targets, reduction="none")
     p   = torch.sigmoid(logits)
     pt  = torch.where(targets > 0.5, p, 1.0 - p)
@@ -25,23 +15,15 @@ def focal_loss_with_logits(logits, targets, alpha=0.25, gamma=2.0):
 
 
 def compute_loss(logits, labels, sent_mask, loss_type="bce", pos_weight=None):
-    """
-    logits: (B, K)
-    labels: (B, K)
-    sent_mask: (B, K)  1=有效，0=padding
-    """
-    # 只在有效位置上计算 loss
     mask = sent_mask > 0.5
     if mask.sum() == 0:
         return torch.tensor(0.0, device=logits.device)
 
-    logits_flat = logits[mask]          # (N,)
-    labels_flat = labels[mask].float()  # (N,)
+    logits_flat = logits[mask]
+    labels_flat = labels[mask].float()
 
     if loss_type == "bce":
-        # 带正类权重的 BCE
         if pos_weight is not None:
-            # pos_weight 需要是 tensor
             loss_fn = nn.BCEWithLogitsLoss(pos_weight=pos_weight)
         else:
             loss_fn = nn.BCEWithLogitsLoss()
@@ -49,23 +31,15 @@ def compute_loss(logits, labels, sent_mask, loss_type="bce", pos_weight=None):
         return loss
 
     elif loss_type == "focal":
-        # focal loss：内部不再额外加权，alpha 在 config 里配
         alpha = getattr(config, "FOCAL_ALPHA", 0.75)
         gamma = getattr(config, "FOCAL_GAMMA", 2.0)
         loss_vec = focal_loss_with_logits(logits_flat, labels_flat, alpha=alpha, gamma=gamma)
         return loss_vec.mean()
-
     else:
         raise ValueError(f"Unknown loss_type: {loss_type}")
 
 
-
 def compute_stats_at_tau(probs_flat, labels_flat, tau):
-    """
-    在给定阈值 tau 下算 acc / precision / recall / f1。
-    probs_flat: (N,)
-    labels_flat: (N,) 0/1
-    """
     preds_flat = (probs_flat >= tau).long()
 
     N = labels_flat.size(0)
@@ -90,26 +64,15 @@ def compute_stats_at_tau(probs_flat, labels_flat, tau):
         "tp": tp,
         "fp": fp,
         "fn": fn,
-        "N": N,
-        "pos": int((labels_flat == 1).sum().item()),
-        "neg": int((labels_flat == 0).sum().item()),
-        "pred_pos": int((preds_flat == 1).sum().item()),
-        "pred_neg": int((preds_flat == 0).sum().item()),
     }
     return stats
 
 
 def sweep_best_tau(probs_flat, labels_flat, tau_list=None):
-    """
-    在一组候选 tau 里扫 F1，找 F1 最大的那个。
-    返回:
-      best_tau, best_stats
-    """
     if tau_list is None:
-        # 你可以自己改这里的范围和步长
-        tau_list = [i / 100.0 for i in range(5, 96, 5)]  # 0.05, 0.10, ..., 0.95
+        tau_list = [i / 100.0 for i in range(5, 96, 5)]
 
-    best_tau = None
+    best_tau = 0.5
     best_stats = None
     best_f1 = -1.0
 
@@ -117,20 +80,16 @@ def sweep_best_tau(probs_flat, labels_flat, tau_list=None):
         stats = compute_stats_at_tau(probs_flat, labels_flat, tau)
         if stats["f1"] > best_f1:
             best_f1 = stats["f1"]
-            best_f1 = stats["f1"]
             best_tau = tau
             best_stats = stats
+
+    if best_stats is None:
+        best_stats = compute_stats_at_tau(probs_flat, labels_flat, 0.5)
 
     return best_tau, best_stats
 
 
 def evaluate(encoder, feat_builder, classifier, dataloader, device):
-    """
-    在一个 dataloader 上跑完整个 dev/test：
-      - 算平均 loss
-      - 在 tau=0.5 下的 acc / precision / recall / f1
-      - 在一组 tau 值里扫 best f1 和对应指标
-    """
     encoder.eval()
     feat_builder.eval()
     classifier.eval()
@@ -149,42 +108,29 @@ def evaluate(encoder, feat_builder, classifier, dataloader, device):
             sent_mask      = batch["sent_mask"].to(device)
             labels         = batch["labels"].to(device)
 
-            meta = {
-                "roles":    batch["roles"].to(device),
-                "sent_len": batch["sent_len"].to(device),
-                "position": batch["position"].to(device),
-            }
+            meta = {}
+            feat_set_str = config.FEATURE_SET if isinstance(config.FEATURE_SET, str) else ""
+            if isinstance(config.FEATURE_SET, list):
+                feat_set_str = ",".join(config.FEATURE_SET)
+            
+            for k in ["roles", "sent_len", "position", "is_question", "has_marker", "speaker_switch", "time_shift"]:
+                if k in batch:
+                    meta[k] = batch[k].to(device)
 
-            # 句向量
             H, sent_mask_enc = encoder(input_ids, attention_mask, sent_spans, sent_mask)
+            feat_out = feat_builder(meta, sent_mask_enc)
 
-            # 先跑一下 feature（边界版暂时不用）
-            _ = feat_builder(meta, sent_mask_enc)
-
-            # 如果这一 batch 的对话都只有 1 句，就没有边界，跳过
             if H.size(1) <= 1:
                 continue
 
-            # 边界向量: (B, K-1, 4*d_enc_sent)
-            H_prev = H[:, :-1, :]
-            H_cur  = H[:, 1:, :]
-
-            H_diff    = H_cur - H_prev
-            H_absdiff = H_diff.abs()
-
-            H_edge = torch.cat(
-                [H_prev, H_cur, H_diff, H_absdiff],
-                dim=-1,
-            )
-
-            # 边界标签和 mask
-            labels_edge = labels[:, 1:]                      # (B, K-1)
-            sent_mask_edge = sent_mask_enc[:, 1:] * sent_mask_enc[:, :-1]
+            logits_all = classifier(H, sent_mask_enc, F=feat_out) 
+            
+            logits = logits_all[:, 1:]            
+            labels_edge = labels[:, 1:]           
+            sent_mask_edge = sent_mask_enc[:, 1:] 
 
             if sent_mask_edge.sum() == 0:
                 continue
-
-            logits = classifier(H_edge, sent_mask_edge, F=None)  # (B, K-1)
 
             loss = compute_loss(
                 logits,
@@ -196,66 +142,71 @@ def evaluate(encoder, feat_builder, classifier, dataloader, device):
             total_loss += loss.item()
             n_batches += 1
 
-            probs = torch.sigmoid(logits)          # (B, K-1)
-            mask  = sent_mask_edge > 0.5          # (B, K-1)
+            probs = torch.sigmoid(logits)           
+            mask  = sent_mask_edge > 0.5           
             all_probs.append(probs[mask].cpu())
             all_labels.append(labels_edge[mask].cpu())
 
-    # 平均 loss
     if n_batches == 0:
         avg_loss = 0.0
     else:
         avg_loss = total_loss / n_batches
 
     if len(all_probs) == 0:
-        return {
-            "loss": avg_loss,
-            "tau": 0.5,
-            "acc": 0.0,
-            "precision": 0.0,
-            "recall": 0.0,
-            "f1": 0.0,
-            "tau_best": 0.5,
-            "f1_best": 0.0,
-        }
+        return {"loss": avg_loss, "f1": 0.0}
 
-    probs_flat  = torch.cat(all_probs, dim=0)   # (N_edge,)
-    labels_flat = torch.cat(all_labels, dim=0)  # (N_edge,)
+    probs_flat  = torch.cat(all_probs, dim=0)   
+    labels_flat = torch.cat(all_labels, dim=0)  
 
-    # τ=0.5 的指标
+    # ==========================================
+    # [DEBUG 2] 检查模型输出的概率分布
+    # ==========================================
+    print("\n" + "="*40)
+    print("[DEBUG MODEL OUTPUT CHECK]")
+    print(f"Mean Probability: {probs_flat.mean().item():.4f}")
+    print(f"Max Probability : {probs_flat.max().item():.4f}")
+    print(f"Min Probability : {probs_flat.min().item():.4f}")
+    
+    # 看看真正超过 0.5 的有多少个
+    count_over_05 = (probs_flat > 0.5).sum().item()
+    total_count = probs_flat.size(0)
+    print(f"Predictions > 0.5: {count_over_05} / {total_count} ({count_over_05/total_count:.2%})")
+    
+    # 看看正样本和负样本分别得了多少分
+    pos_mask = labels_flat > 0.5
+    neg_mask = labels_flat < 0.5
+    
+    if pos_mask.sum() > 0:
+        avg_pos = probs_flat[pos_mask].mean().item()
+        print(f"Avg Score on True Positive (Label=1): {avg_pos:.4f}")
+    else:
+        print("Avg Score on True Positive: N/A (No positives)")
+        
+    if neg_mask.sum() > 0:
+        avg_neg = probs_flat[neg_mask].mean().item()
+        print(f"Avg Score on True Negative (Label=0): {avg_neg:.4f}")
+    print("="*40 + "\n")
+    # ==========================================
+
     stats_05 = compute_stats_at_tau(probs_flat, labels_flat, tau=0.5)
-
-    # 在一组 tau 里面扫 best f1
     tau_list = [0.05 * i for i in range(1, 20)]
     best_tau, best_stats = sweep_best_tau(probs_flat, labels_flat, tau_list)
 
-    # 打印几个 summary
     N = labels_flat.numel()
     pos = int(labels_flat.sum().item())
     neg = N - pos
-    pred_pos_05 = int((probs_flat >= 0.5).sum().item())
-    pred_neg_05 = N - pred_pos_05
+    
+    tp_b = best_stats["tp"]
+    fp_b = best_stats["fp"]
+    fn_b = best_stats["fn"]
+    tn_b = N - tp_b - fp_b - fn_b
 
     print(
-        f"[EVAL] tau=0.5: N={N} pos={pos} neg={neg} "
-        f"pred_pos={pred_pos_05} pred_neg={pred_neg_05} "
-        f"tp={stats_05['tp']} fp={stats_05['fp']} fn={stats_05['fn']}"
-    )
-
-    N_b  = N
-    pos_b = pos
-    neg_b = neg
-    tp_b  = best_stats["tp"]
-    fp_b  = best_stats["fp"]
-    fn_b  = best_stats["fn"]
-    tn_b  = N_b - tp_b - fp_b - fn_b
-
-    print(
-        "[EVAL] Confusion matrix at best_tau "
-        f"({best_tau:.2f}):\n"
-        f"         pred=0    pred=1\n"
-        f"true=0   {tn_b:6d}   {fp_b:6d}\n"
-        f"true=1   {fn_b:6d}   {tp_b:6d}"
+        f"[EVAL] Best Tau={best_tau:.2f} | F1={best_stats['f1']:.4f}\n"
+        f"       Confusion Matrix:\n"
+        f"                 Pred=0    Pred=1\n"
+        f"       True=0   {tn_b:6d}   {fp_b:6d}\n"
+        f"       True=1   {fn_b:6d}   {tp_b:6d}"
     )
 
     metrics = {
@@ -267,8 +218,5 @@ def evaluate(encoder, feat_builder, classifier, dataloader, device):
         "f1": stats_05["f1"],
         "tau_best": best_tau,
         "f1_best": best_stats["f1"],
-        "precision_best": best_stats["precision"],
-        "recall_best": best_stats["recall"],
     }
     return metrics
-

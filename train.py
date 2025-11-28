@@ -1,3 +1,5 @@
+# train.py
+
 import torch
 import torch.nn as nn
 from transformers import AutoTokenizer
@@ -13,6 +15,7 @@ from evaluation import compute_loss, evaluate
 def set_seed(seed):
     torch.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
+
 
 def train_one_epoch(
     encoder,
@@ -41,6 +44,32 @@ def train_one_epoch(
         sent_mask      = batch["sent_mask"].to(device)
         labels         = batch["labels"].to(device)
 
+        # ==========================================
+        # [DEBUG 1] 检查训练数据的标签分布
+        # ==========================================
+        if i == 0:
+            print("\n" + "="*40)
+            print("[DEBUG DATA CHECK - TRAIN BATCH 0]")
+            flat_labels = labels.view(-1).cpu().numpy()
+            
+            # 统计 0 和 1 的数量
+            num_1 = (labels == 1).sum().item()
+            num_0 = (labels == 0).sum().item()
+            total = labels.numel()
+            
+            print(f"Sample Labels (first 20): {flat_labels[:20]}")
+            print(f"Stats: 0s (Same)={num_0}, 1s (New)={num_1}")
+            
+            if total > 0:
+                print(f"Ratio of 1s: {num_1/total:.4f}")
+            
+            if num_1 > num_0:
+                print("⚠️  警告: 这个 Batch 里 1(New) 居然比 0(Same) 多？请务必检查 _map_label！")
+            else:
+                print("✅ 数据分布正常: 0(Same) 多，1(New) 少。")
+            print("="*40 + "\n")
+        # ==========================================
+
         meta = {}
         if isinstance(config.FEATURE_SET, str):
             feat_names = [x.strip() for x in config.FEATURE_SET.split(",") if x.strip()]
@@ -51,46 +80,24 @@ def train_one_epoch(
             if name in batch:
                 meta[name] = batch[name].to(device)
 
-        # 句向量 H: (B, K, d_enc_sent)
         H, sent_mask_enc = encoder(input_ids, attention_mask, sent_spans, sent_mask)
+        feat_out = feat_builder(meta, sent_mask_enc)
 
-        # 先算一下句子特征（现在边界版里先不用，预留位置）
-        _ = feat_builder(meta, sent_mask_enc)
-
-        # ========== 边界表示：u(i-1) -> u(i) ==========
-        # 如果整段对话只有一个句子，就没有边界可以学，直接跳过这个 batch
         if H.size(1) <= 1:
             continue
+            
+        logits_all = classifier(H, sent_mask_enc, F=feat_out) 
 
-        # H_prev / H_cur: (B, K-1, d_enc_sent)
-        H_prev = H[:, :-1, :]
-        H_cur  = H[:, 1:, :]
+        # 切片：忽略第0句
+        logits_edge = logits_all[:, 1:]        
+        labels_edge = labels[:, 1:]            
+        sent_mask_edge = sent_mask_enc[:, 1:]  
 
-        H_diff    = H_cur - H_prev
-        H_absdiff = H_diff.abs()
-
-        # H_edge: (B, K-1, 4 * d_enc_sent)
-        H_edge = torch.cat(
-            [H_prev, H_cur, H_diff, H_absdiff],
-            dim=-1,
-        )
-
-        # 边界标签：用“当前句”的标签，表示 u(i-1) -> u(i) 这条边
-        labels_edge = labels[:, 1:]                # (B, K-1)
-
-        # 边界 mask：前后两句都存在才是有效边
-        sent_mask_edge = sent_mask_enc[:, 1:] * sent_mask_enc[:, :-1]   # (B, K-1)
-
-        # 极端情况：这个 batch 里实际上没有有效边（mask 全 0），就跳过
         if sent_mask_edge.sum() == 0:
             continue
 
-        # 边界级分类器：不再用句子特征，F 传 None
-        logits = classifier(H_edge, sent_mask_edge, F=None)  # (B, K-1)
-
-        # 用边界标签和边界 mask 算 loss
         loss = compute_loss(
-            logits,
+            logits_edge,
             labels_edge,
             sent_mask_edge,
             loss_type=loss_type,
@@ -106,17 +113,9 @@ def train_one_epoch(
             step += 1
             total_loss += loss.item()
 
-        if i == 0:
-            print(
-                "H_edge shape:", H_edge.shape,
-                "logits shape:", logits.shape,
-                "labels_edge shape:", labels_edge.shape,
-            )
-
     if step == 0:
         return 0.0
     return total_loss / step
-
 
 
 def main():
@@ -157,36 +156,39 @@ def main():
         feature_set=config.FEATURE_SET
     ).to(device)
 
-    # 单句向量维度
-    d_enc_sent = encoder.hidden_size
-
-    # 边界向量: [prev, cur, diff, |diff|] → 4 * d_enc_sent
-    d_enc = d_enc_sent * 4
-
-    # 目前边界版暂时不拼句子 feature，保持 0
-    d_feat = 0
+    d_enc_input = encoder.hidden_size
+    d_feat_dim = feat_builder.get_dim()
 
     classifier = SentenceShiftClassifier(
-        d_enc=d_enc,
-        d_feat=d_feat,
+        d_enc=d_enc_input,       
+        d_feat=d_feat_dim,       
         backbone=config.BACKBONE,
+        hidden_size=256,
+        cnn_filters=getattr(config, "CNN_FILTERS", 100),
+        cnn_kernels=getattr(config, "CNN_KERNEL_SIZES", [2, 3]),
     ).to(device)
 
-
+    print(f"Model initialized. Backbone: {config.BACKBONE}")
 
     params = (
         list(encoder.parameters())
         + list(feat_builder.parameters())
         + list(classifier.parameters())
     )
+    
     optimizer = torch.optim.AdamW(
         params,
         lr=config.LR_HEAD,
         weight_decay=config.WEIGHT_DECAY,
     )
 
-    pos_weight = torch.tensor(config.POS_WEIGHT, device=device)
-
+    # 处理 POS_WEIGHT 为 None 的情况
+    if config.POS_WEIGHT is not None:
+        pos_weight = torch.tensor(config.POS_WEIGHT, device=device)
+        print(f"Using POS_WEIGHT: {config.POS_WEIGHT}")
+    else:
+        pos_weight = None
+        print("Using NO POS_WEIGHT (Standard BCE)")
 
     for epoch in range(config.EPOCHS):
         print("=== Epoch", epoch, "===")
