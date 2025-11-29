@@ -7,20 +7,20 @@ UNFREEZE_TOP = 8
 
 BACKBONE = "cnn" # "none" / "rnn" / "lstm" / "gru" / "cnn"
 FEATURE_SET = [
-    # "roles",
-    # "sent_len",
-    # "position",
-    # "is_question",
-    # "has_marker",
-    # "speaker_switch",
-    # "time_shift",
+    "roles",               # 原来的角色 embedding
+    "sent_len",            # 原来的句长
+    "position",            # 原来的句子位置
+    "speaker_change",      # 1：说话人是否变化
+    "run_len_same_speaker",# 1：同一说话人连续长度
+    "is_question",         # 2：当前句是否问句
+    "disc_marker",         # 2：是否包含显式话题 marker
 ]
 
 BATCH_SIZE_DIALOG = 8
 LR_ENC = 1e-5
-LR_HEAD = 2e-5
+LR_HEAD = 1e-5
 WEIGHT_DECAY = 0.01
-EPOCHS = 9
+EPOCHS = 20
 SEED = 42
 
 LOSS_TYPE = "focal"

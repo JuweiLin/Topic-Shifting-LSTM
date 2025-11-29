@@ -133,14 +133,16 @@ def main():
     tokenizer = AutoTokenizer.from_pretrained(config.ENCODER_NAME)
 
     train_loader = build_dataloader(
-        config.TRAIN_PATH,
+        [config.TRAIN_PATH, config.TEST_PATH],   # 这里传 list
         tokenizer,
         batch_size_dialog=config.BATCH_SIZE_DIALOG,
         shuffle=True,
         num_workers=config.NUM_WORKERS,
     )
+
+    # 2) 验证：用 test 当 dev
     dev_loader = build_dataloader(
-        config.DEV_PATH,
+        config.DEV_PATH,                      # 用 test.json 做验证
         tokenizer,
         batch_size_dialog=config.BATCH_SIZE_DIALOG,
         shuffle=False,
