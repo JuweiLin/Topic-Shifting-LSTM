@@ -23,15 +23,15 @@ class MultiScaleCNN(nn.Module):
         self.dropout = nn.Dropout(dropout)
 
     def forward(self, x):
-        # x: (B, C, L)
+        # x: (B, C_in, K)
         outs = []
         for conv, bn in zip(self.convs, self.bns):
-            o = conv(x)       # (B, F, L)
+            o = conv(x)       # (B, F, K)
             o = bn(o)
             o = F.relu(o)
             o = self.dropout(o)
             outs.append(o)
-        # 通道维拼接 -> (B, F * len(kernel_sizes), L)
+        # 通道维拼接 -> (B, F * len(kernel_sizes), K)
         return torch.cat(outs, dim=1)
 
 
@@ -40,20 +40,22 @@ class SentenceShiftClassifier(nn.Module):
         self,
         d_enc,
         d_feat=0,
-        backbone="lstm",    # "none" / "rnn" / "lstm" / "gru" / "cnn"
+        backbone="lstm",        # "none" / "rnn" / "lstm" / "gru" / "cnn"
         hidden_size=512,
         num_layers=2,
         dropout=0.2,
-        cnn_filters=128,              # 新增: CNN 每个 kernel 的通道数
-        cnn_kernel_sizes=(2, 3, 4),   # 新增: 多尺度卷积的 kernel size
-        **kwargs,                     # 防止多传别的参数崩掉
+        cnn_filters=200,        # 每个 kernel 的通道数，相当于 CNN hidden_size
+        cnn_kernel_sizes=(2,3,4),
+        head_hidden=256,        # 句级 MLP head 的隐藏维度
+        **kwargs,
     ):
         super().__init__()
         self.backbone_type = backbone
         d_in = d_enc + d_feat
 
         self.backbone = None
-        self.cnn = None
+        self.cnn_stage1 = None
+        self.cnn_stage2 = None
         d_backbone_out = d_in
 
         # 1) 不做序列建模
@@ -95,23 +97,39 @@ class SentenceShiftClassifier(nn.Module):
             )
             d_backbone_out = 2 * hidden_size
 
-        # 3) CNN：这里真正用 MultiScaleCNN
+        # 3) CNN: LeNet 风格的 1D CNN（stage1 + stage2）
         elif backbone == "cnn":
-            self.cnn = MultiScaleCNN(
+            # Stage 1: 多尺度卷积（你现在已经在用的 MultiScaleCNN）
+            self.cnn_stage1 = MultiScaleCNN(
                 input_dim=d_in,
                 num_filters=cnn_filters,
                 kernel_sizes=cnn_kernel_sizes,
                 dropout=dropout,
             )
-            # MultiScaleCNN 会在通道维度 concat，输出通道数 = filters * kernel_sizes 个数
-            d_backbone_out = cnn_filters * len(cnn_kernel_sizes)
+            c1 = cnn_filters * len(cnn_kernel_sizes)   # stage1 输出通道数
+
+            # Stage 2: 再来一层 1D Conv block，扩大一点感受野
+            self.cnn_stage2 = nn.Sequential(
+                nn.Conv1d(c1, c1, kernel_size=3, padding=1),
+                nn.BatchNorm1d(c1),
+                nn.ReLU(),
+                nn.Dropout(dropout),
+            )
+
+            d_backbone_out = c1   # 最终每句的 hidden 维度
 
         else:
             raise ValueError("Unknown backbone: %s" % backbone)
 
+        # 归一化 + Dropout + 两层 MLP head
         self.ln = nn.LayerNorm(d_backbone_out)
         self.dropout = nn.Dropout(dropout)
-        self.head = nn.Linear(d_backbone_out, 1)
+        self.head = nn.Sequential(
+            nn.Linear(d_backbone_out, head_hidden),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(head_hidden, 1),
+        )
 
     def forward(self, H, sent_mask, F=None):
         """
@@ -124,7 +142,7 @@ class SentenceShiftClassifier(nn.Module):
         else:
             X = H
 
-        # pad 位置置零，干净一点
+        # pad 位置置零
         if sent_mask is not None:
             X = X * sent_mask.unsqueeze(-1)
 
@@ -132,13 +150,21 @@ class SentenceShiftClassifier(nn.Module):
         if self.backbone_type in ["rnn", "lstm", "gru"]:
             X, _ = self.backbone(X)  # (B, K, d_backbone_out)
 
-        # CNN：Conv1d 输入是 (B, C, L)，这里 L=句子数K
+        # CNN: Stage1 + Stage2 都在句子轴 K 上卷积
         elif self.backbone_type == "cnn":
-            X_c = X.transpose(1, 2)        # (B, d_in, K)
-            X_c = self.cnn(X_c)            # (B, F * len(k), K)
-            X = X_c.transpose(1, 2)        # (B, K, F * len(k))
+            # (B, K, d_in) -> (B, d_in, K)
+            X_c = X.transpose(1, 2)
 
-        # backbone == "none" 就直接用 X
+            # Stage 1: MultiScale CNN
+            X_c = self.cnn_stage1(X_c)     # (B, c1, K)
+
+            # Stage 2: 再卷一层
+            X_c = self.cnn_stage2(X_c)     # (B, c1, K)
+
+            # 回到 (B, K, c1)
+            X = X_c.transpose(1, 2)
+
+        # backbone == "none": 直接用 X
 
         Z = self.ln(X)
         Z = self.dropout(Z)

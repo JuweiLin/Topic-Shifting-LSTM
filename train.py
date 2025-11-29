@@ -165,8 +165,9 @@ def main():
         backbone=config.BACKBONE,
         hidden_size=256,
         cnn_filters=getattr(config, "CNN_FILTERS", 100),
-        cnn_kernels=getattr(config, "CNN_KERNEL_SIZES", [2, 3]),
+        cnn_kernel_sizes=tuple(getattr(config, "CNN_KERNEL_SIZES", [2, 3])),
     ).to(device)
+
 
     print(f"Model initialized. Backbone: {config.BACKBONE}")
 
