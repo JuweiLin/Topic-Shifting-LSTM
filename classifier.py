@@ -18,9 +18,34 @@ class MultiScaleCNN(nn.Module):
                 padding="same",
             )
             self.convs.append(conv)
-            self.bns.append(nn.BatchNorm1d(num_filters))
+            # 不再用 BatchNorm1d，避免小 batch 统计不稳定
+            self.bns.append(nn.Identity())
             
         self.dropout = nn.Dropout(dropout)
+
+    def forward(self, x):
+        # x: (B, C_in, K)
+        outs = []
+        for conv, bn in zip(self.convs, self.bns):
+            o = conv(x)       # (B, F, K)
+            o = bn(o)         # 现在是 Identity，不改变数值
+            o = F.relu(o)
+            o = self.dropout(o)
+            outs.append(o)
+        return torch.cat(outs, dim=1)
+
+
+    def forward(self, x):
+        # x: (B, C_in, K)
+        outs = []
+        for conv, bn in zip(self.convs, self.bns):
+            o = conv(x)       # (B, F, K)
+            o = bn(o)
+            o = F.relu(o)
+            o = self.dropout(o)
+            outs.append(o)
+        return torch.cat(outs, dim=1)
+
 
     def forward(self, x):
         # x: (B, C_in, K)

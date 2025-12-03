@@ -3,7 +3,7 @@ import torch.nn as nn
 from transformers import AutoModel
 
 
-class QwenSentenceEncoder(nn.Module):
+class HFEncoder(nn.Module):
     def __init__(self, model_name="FacebookAI/roberta-base", unfreeze_top=8):
         super().__init__()
         self.model = AutoModel.from_pretrained(model_name)
@@ -11,38 +11,91 @@ class QwenSentenceEncoder(nn.Module):
         self._freeze_layers(unfreeze_top)
         # 注意力池化头：给每个 token 打一个分数
         self.sent_pool = nn.Linear(self.hidden_size, 1)
+
+    @staticmethod
+    def _get_transformer_layers(model):
+        """
+        通用地拿到 encoder 的 block 列表，兼容 Roberta / DeBERTa / BART 等
+        """
+        # Roberta / BERT: model.encoder.layer
+        if hasattr(model, "encoder") and hasattr(model.encoder, "layer"):
+            return model.encoder.layer
+
+        # DeBERTa-v2/v3: model.deberta.encoder.layer
+        if (
+            hasattr(model, "deberta")
+            and hasattr(model.deberta, "encoder")
+            and hasattr(model.deberta.encoder, "layer")
+        ):
+            return model.deberta.encoder.layer
+
+        # BART: model.model.encoder.layers
+        if (
+            hasattr(model, "model")
+            and hasattr(model.model, "encoder")
+            and hasattr(model.model.encoder, "layers")
+        ):
+            return model.model.encoder.layers
+
+        # 找不到就返回 None
+        return None
+
         
     def _freeze_layers(self, unfreeze_top):
-        if not hasattr(self.model, "model") or not hasattr(self.model.model, "layers"):
-            return
+        """
+        unfreeze_top 语义：
+          - -1: 全部解冻（不冻结）
+          - 0: 全部冻结（只训练后面的分类头）
+          - >0: 解冻最后 N 层 encoder block
+        """
+        layers = self._get_transformer_layers(self.model)
 
-        blocks = self.model.model.layers
-        n = len(blocks)
-        keep_from = max(0, n - unfreeze_top)
-
+        # 先全部冻结
         for p in self.model.parameters():
             p.requires_grad = False
 
-        for i, block in enumerate(blocks):
+        # -1 表示全部解冻
+        if unfreeze_top == -1:
+            for p in self.model.parameters():
+                p.requires_grad = True
+            return
+
+        # 没找到层，或者 unfreeze_top == 0，就保持全冻结
+        if layers is None or unfreeze_top <= 0:
+            return
+
+        # 解冻最后 N 层
+        total = len(layers)
+        keep_from = max(0, total - unfreeze_top)
+        for i, block in enumerate(layers):
             if i >= keep_from:
                 for p in block.parameters():
+                    p.requires_grad = True
+
+        # 如果有一些最终的 LayerNorm / pooler，可以顺带解冻（可选）
+        for attr in ["layernorm", "LayerNorm", "ln_f", "final_layer_norm", "pooler"]:
+            mod = getattr(self.model, attr, None)
+            if mod is not None:
+                for p in mod.parameters():
                     p.requires_grad = True
 
     def forward(self, input_ids, attention_mask, sent_spans, sent_mask=None):
         outputs = self.model(
             input_ids=input_ids,
             attention_mask=attention_mask,
+            output_hidden_states=False,
+            return_dict=True,
         )
         token_hidden = outputs.last_hidden_state  # (B, L, hidden_size)
 
-        # 这里直接用注意力池化，不保留原来的 mean pooling
         H, sent_mask_out = mean_pool_by_spans(
             token_hidden,
             sent_spans,
-            attention_mask,
+            attention_mask=attention_mask,
             sent_pool=self.sent_pool,
         )
         return H, sent_mask_out
+
 
 
 def mean_pool_by_spans(

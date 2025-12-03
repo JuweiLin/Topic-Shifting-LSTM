@@ -88,14 +88,27 @@ class SentenceFeatureBuilder(nn.Module):
     # ====== 每个 feature 一个小函数 ======
 
     def _feat_roles(self, meta):
-        roles = meta["roles"]                   # (B, K)
+        roles = meta.get("roles", None)
+        if roles is None:
+            # 用 sent_len 推 B,K，然后造一个 0 填充的 roles
+            device = next(self.parameters()).device
+            ref = meta.get("sent_len", None)
+            if ref is None:
+                raise ValueError("roles feature requested but neither 'roles' nor 'sent_len' is found in batch_meta.")
+            B, K = ref.shape
+            roles = torch.zeros(B, K, dtype=torch.long, device=device)
+
         roles = roles.clamp(min=0, max=self.num_roles - 1)
         return self.role_emb(roles)            # (B, K, role_dim)
 
+
     def _feat_sent_len(self, meta):
+        if "sent_len" not in meta:
+            raise ValueError("Feature 'sent_len' requested but 'sent_len' is missing in batch_meta.")
         sent_len = meta["sent_len"].float()     # (B, K)
         norm_len = torch.log1p(sent_len) / 5.0
         return norm_len.unsqueeze(-1)           # (B, K, 1)
+
 
     def _feat_position(self, meta):
         position = meta["position"].float()     # (B, K)

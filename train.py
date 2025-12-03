@@ -4,8 +4,11 @@ import torch
 import torch.nn as nn
 from transformers import AutoTokenizer
 
+import random
+import numpy as np
+
 from load_tiage import build_dataloader
-from embedding import QwenSentenceEncoder
+from embedding import HFEncoder
 from feature import SentenceFeatureBuilder
 from classifier import SentenceShiftClassifier
 import config
@@ -15,6 +18,9 @@ from evaluation import compute_loss, evaluate
 def set_seed(seed):
     torch.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
+    random.seed(seed)
+    np.random.seed(seed)
+
 
 
 def train_one_epoch(
@@ -44,30 +50,7 @@ def train_one_epoch(
         sent_mask      = batch["sent_mask"].to(device)
         labels         = batch["labels"].to(device)
 
-        # ==========================================
-        # [DEBUG 1] 检查训练数据的标签分布
-        # ==========================================
-        if i == 0:
-            print("\n" + "="*40)
-            print("[DEBUG DATA CHECK - TRAIN BATCH 0]")
-            flat_labels = labels.view(-1).cpu().numpy()
-            
-            # 统计 0 和 1 的数量
-            num_1 = (labels == 1).sum().item()
-            num_0 = (labels == 0).sum().item()
-            total = labels.numel()
-            
-            print(f"Sample Labels (first 20): {flat_labels[:20]}")
-            print(f"Stats: 0s (Same)={num_0}, 1s (New)={num_1}")
-            
-            if total > 0:
-                print(f"Ratio of 1s: {num_1/total:.4f}")
-            
-            if num_1 > num_0:
-                print("⚠️  警告: 这个 Batch 里 1(New) 居然比 0(Same) 多？请务必检查 _map_label！")
-            else:
-                print("✅ 数据分布正常: 0(Same) 多，1(New) 少。")
-            print("="*40 + "\n")
+
         # ==========================================
 
         meta = {}
@@ -130,7 +113,13 @@ def main():
 
     print("device:", device)
 
-    tokenizer = AutoTokenizer.from_pretrained(config.ENCODER_NAME)
+    tokenizer = AutoTokenizer.from_pretrained(config.ENCODER_NAME, use_fast=True)
+
+    # 保证 SENT_TOKEN 在 vocab 里（用于句子边界）
+    if hasattr(config, "SENT_TOKEN") and config.SENT_TOKEN not in tokenizer.get_vocab():
+        tokenizer.add_special_tokens({"additional_special_tokens": [config.SENT_TOKEN]})
+        print(f"Added SENT_TOKEN '{config.SENT_TOKEN}' to tokenizer.")
+
 
     train_loader = build_dataloader(
         [config.TRAIN_PATH, config.TEST_PATH],   # 这里传 list
@@ -149,10 +138,15 @@ def main():
         num_workers=config.NUM_WORKERS,
     )
 
-    encoder = QwenSentenceEncoder(
+    encoder = HFEncoder(
         model_name=config.ENCODER_NAME,
         unfreeze_top=config.UNFREEZE_TOP,
     ).to(device)
+    # 如果 tokenizer vocab 大小变了，扩展 encoder 的词表
+    if hasattr(encoder, "model") and hasattr(encoder.model, "resize_token_embeddings"):
+        encoder.model.resize_token_embeddings(len(tokenizer))
+        print("Resized token embeddings to", len(tokenizer))
+
 
     feat_builder = SentenceFeatureBuilder(
         feature_set=config.FEATURE_SET
@@ -173,15 +167,17 @@ def main():
 
     print(f"Model initialized. Backbone: {config.BACKBONE}")
 
-    params = (
-        list(encoder.parameters())
-        + list(feat_builder.parameters())
-        + list(classifier.parameters())
-    )
-    
+    enc_params = [p for p in encoder.parameters() if p.requires_grad]
+    other_params = list(feat_builder.parameters()) + list(classifier.parameters())
+
+    print(f"Encoder trainable params: {sum(p.numel() for p in enc_params)}")
+    print(f"Head+Feature trainable params: {sum(p.numel() for p in other_params)}")
+
     optimizer = torch.optim.AdamW(
-        params,
-        lr=config.LR_HEAD,
+        [
+            {"params": enc_params, "lr": config.LR_ENC},
+            {"params": other_params, "lr": config.LR_HEAD},
+        ],
         weight_decay=config.WEIGHT_DECAY,
     )
 

@@ -68,9 +68,15 @@ def compute_stats_at_tau(probs_flat, labels_flat, tau):
     return stats
 
 
-def sweep_best_tau(probs_flat, labels_flat, tau_list=None):
+def sweep_best_tau(probs_flat, labels_flat, tau_list=None, step=0.01):
+    """
+    扫描不同 tau 找 F1 最优的阈值
+    - 默认: 从 0.00 到 1.00, 步长 step
+    - 也可以直接传 tau_list 覆盖
+    """
     if tau_list is None:
-        tau_list = [i / 100.0 for i in range(5, 96, 5)]
+        n_steps = int(1.0 / step)
+        tau_list = [i * step for i in range(0, n_steps + 1)]
 
     best_tau = 0.5
     best_stats = None
@@ -78,8 +84,9 @@ def sweep_best_tau(probs_flat, labels_flat, tau_list=None):
 
     for tau in tau_list:
         stats = compute_stats_at_tau(probs_flat, labels_flat, tau)
-        if stats["f1"] > best_f1:
-            best_f1 = stats["f1"]
+        f1 = stats["f1"]
+        if f1 > best_f1:
+            best_f1 = f1
             best_tau = tau
             best_stats = stats
 
@@ -87,6 +94,8 @@ def sweep_best_tau(probs_flat, labels_flat, tau_list=None):
         best_stats = compute_stats_at_tau(probs_flat, labels_flat, 0.5)
 
     return best_tau, best_stats
+
+
 
 
 def evaluate(encoder, feat_builder, classifier, dataloader, device):
@@ -109,13 +118,15 @@ def evaluate(encoder, feat_builder, classifier, dataloader, device):
             labels         = batch["labels"].to(device)
 
             meta = {}
-            feat_set_str = config.FEATURE_SET if isinstance(config.FEATURE_SET, str) else ""
-            if isinstance(config.FEATURE_SET, list):
-                feat_set_str = ",".join(config.FEATURE_SET)
-            
-            for k in ["roles", "sent_len", "position", "is_question", "has_marker", "speaker_switch", "time_shift"]:
-                if k in batch:
-                    meta[k] = batch[k].to(device)
+            if isinstance(config.FEATURE_SET, str):
+                feat_names = [x.strip() for x in config.FEATURE_SET.split(",") if x.strip()]
+            else:
+                feat_names = list(config.FEATURE_SET)
+
+            for name in feat_names:
+                if name in batch:
+                    meta[name] = batch[name].to(device)
+
 
             H, sent_mask_enc = encoder(input_ids, attention_mask, sent_spans, sent_mask)
             feat_out = feat_builder(meta, sent_mask_enc)
@@ -159,38 +170,17 @@ def evaluate(encoder, feat_builder, classifier, dataloader, device):
     labels_flat = torch.cat(all_labels, dim=0)  
 
     # ==========================================
-    # [DEBUG 2] 检查模型输出的概率分布
-    # ==========================================
-    print("\n" + "="*40)
-    print("[DEBUG MODEL OUTPUT CHECK]")
-    print(f"Mean Probability: {probs_flat.mean().item():.4f}")
-    print(f"Max Probability : {probs_flat.max().item():.4f}")
-    print(f"Min Probability : {probs_flat.min().item():.4f}")
-    
-    # 看看真正超过 0.5 的有多少个
-    count_over_05 = (probs_flat > 0.5).sum().item()
-    total_count = probs_flat.size(0)
-    print(f"Predictions > 0.5: {count_over_05} / {total_count} ({count_over_05/total_count:.2%})")
-    
-    # 看看正样本和负样本分别得了多少分
-    pos_mask = labels_flat > 0.5
-    neg_mask = labels_flat < 0.5
-    
-    if pos_mask.sum() > 0:
-        avg_pos = probs_flat[pos_mask].mean().item()
-        print(f"Avg Score on True Positive (Label=1): {avg_pos:.4f}")
-    else:
-        print("Avg Score on True Positive: N/A (No positives)")
-        
-    if neg_mask.sum() > 0:
-        avg_neg = probs_flat[neg_mask].mean().item()
-        print(f"Avg Score on True Negative (Label=0): {avg_neg:.4f}")
-    print("="*40 + "\n")
-    # ==========================================
 
     stats_05 = compute_stats_at_tau(probs_flat, labels_flat, tau=0.5)
-    tau_list = [0.05 * i for i in range(1, 20)]
-    best_tau, best_stats = sweep_best_tau(probs_flat, labels_flat, tau_list)
+
+    # 用细粒度阈值从 0~1 扫一遍，步长 0.01
+    best_tau, best_stats = sweep_best_tau(
+        probs_flat,
+        labels_flat,
+        tau_list=None,  # 不传就用 step 生成 [0.00, 0.01, ..., 1.00]
+        step=0.01
+    )
+
 
     N = labels_flat.numel()
     pos = int(labels_flat.sum().item())
