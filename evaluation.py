@@ -6,12 +6,28 @@ import torch.nn.functional as F
 import config
 
 
-def focal_loss_with_logits(logits, targets, alpha=0.25, gamma=2.0):
+def focal_loss_with_logits(logits, targets, alpha=None, gamma=2.0):
     bce = F.binary_cross_entropy_with_logits(logits, targets, reduction="none")
-    p   = torch.sigmoid(logits)
-    pt  = torch.where(targets > 0.5, p, 1.0 - p)
-    loss = alpha * (1.0 - pt) ** gamma * bce
+    p = torch.sigmoid(logits)
+    pt = torch.where(targets > 0.5, p, 1.0 - p)
+
+    if alpha is None:
+        w = 1.0
+    elif isinstance(alpha, (float, int)):
+        w = torch.where(targets > 0.5, alpha, 1.0 - alpha)
+    elif torch.is_tensor(alpha):
+        alpha = alpha.to(logits.device)
+        if alpha.numel() == 2:
+            # [alpha_neg, alpha_pos]
+            w = torch.where(targets > 0.5, alpha[1], alpha[0])
+        else:
+            w = alpha
+    else:
+        raise ValueError(f"Unsupported alpha type: {type(alpha)}")
+
+    loss = w * (1.0 - pt) ** gamma * bce
     return loss
+
 
 
 def compute_loss(logits, labels, sent_mask, loss_type="bce", pos_weight=None):
@@ -69,11 +85,6 @@ def compute_stats_at_tau(probs_flat, labels_flat, tau):
 
 
 def sweep_best_tau(probs_flat, labels_flat, tau_list=None, step=0.01):
-    """
-    扫描不同 tau 找 F1 最优的阈值
-    - 默认: 从 0.00 到 1.00, 步长 step
-    - 也可以直接传 tau_list 覆盖
-    """
     if tau_list is None:
         n_steps = int(1.0 / step)
         tau_list = [i * step for i in range(0, n_steps + 1)]
@@ -173,11 +184,10 @@ def evaluate(encoder, feat_builder, classifier, dataloader, device):
 
     stats_05 = compute_stats_at_tau(probs_flat, labels_flat, tau=0.5)
 
-    # 用细粒度阈值从 0~1 扫一遍，步长 0.01
     best_tau, best_stats = sweep_best_tau(
         probs_flat,
         labels_flat,
-        tau_list=None,  # 不传就用 step 生成 [0.00, 0.01, ..., 1.00]
+        tau_list=None,
         step=0.01
     )
 

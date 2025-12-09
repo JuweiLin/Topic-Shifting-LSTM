@@ -14,7 +14,6 @@ class TIAGEDataset(Dataset):
         self._load(json_path)
 
     def _load(self, json_path):
-        # 统一成 list[路径]
         if isinstance(json_path, (list, tuple)):
             paths = list(json_path)
         else:
@@ -25,16 +24,12 @@ class TIAGEDataset(Dataset):
         for path in paths:
             with open(path, "r", encoding="utf-8") as f:
                 raw = json.load(f)
-
-            # 适配 {"dial_data": {"tiage": [ ... ]}} 这种结构
             if isinstance(raw, dict) and "dial_data" in raw and "tiage" in raw["dial_data"]:
                 dialogs = raw["dial_data"]["tiage"]
             else:
                 dialogs = raw
 
             dialogs_all.extend(dialogs)
-
-        # 存成 list[dialog]
         self.data = dialogs_all
 
 
@@ -61,7 +56,6 @@ class TIAGEDataset(Dataset):
         sent_len = []
         position = []
 
-        # 新增：句级 feature 的原始值
         is_question = []
         disc_marker = []
 
@@ -73,12 +67,12 @@ class TIAGEDataset(Dataset):
             label = self._map_label(raw_label)   # 0/1
             role_id = self._map_role(raw_role)   # user/agent -> 0/1/2
 
-            # is_question：当前句是否问句
+            # is_question
             txt_strip = text.strip()
             is_q = 1 if txt_strip.endswith("?") else 0
             is_question.append(is_q)
 
-            # disc_marker：是否包含显式话题标记
+            # disc_marker
             lower = text.lower()
             has_marker = 1 if any(m in lower for m in DISCOURSE_MARKERS) else 0
             disc_marker.append(has_marker)
@@ -145,8 +139,6 @@ def collate_batch(batch):
     sent_len = torch.zeros(B, K_max, dtype=torch.long)
     position = torch.zeros(B, K_max, dtype=torch.long)
     sent_mask = torch.zeros(B, K_max, dtype=torch.float)
-
-    # 新增：问句 + marker
     is_question = torch.zeros(B, K_max, dtype=torch.long)
     disc_marker = torch.zeros(B, K_max, dtype=torch.long)
 
@@ -165,11 +157,11 @@ def collate_batch(batch):
 
         sent_spans_batch.append(item["sent_spans"])
 
-    # speaker_change：当前句和上一句角色是否变化
+    # speaker_change
     speaker_change = torch.zeros_like(roles)
     speaker_change[:, 1:] = (roles[:, 1:] != roles[:, :-1]).long()
 
-    # run_len_same_speaker：同一说话人连续长度
+    # run_len_same_speaker
     run_len_same_speaker = torch.zeros_like(roles)
     for b in range(B):
         run = 0

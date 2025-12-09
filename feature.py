@@ -6,27 +6,9 @@ from tables import ROLE2ID
 
 
 class SentenceFeatureBuilder(nn.Module):
-    """
-    feature_set:
-      - "none" 或 ""  -> 不用任何句级特征
-      - 列表或逗号分隔字符串:
-        例如 ["roles", "sent_len", "position", "is_question"]
-        或   "roles,sent_len,position,is_question"
-
-    支持的 key（也是 batch/meta 里的字段名）：
-      - "roles"
-      - "sent_len"
-      - "position"
-      - "speaker_change"
-      - "run_len_same_speaker"
-      - "is_question"
-      - "disc_marker"
-    """
-
     def __init__(self, feature_set="none", d_feat=64):
         super().__init__()
 
-        # 解析 feature_set
         if isinstance(feature_set, str):
             s = feature_set.strip()
             if s == "" or s == "none":
@@ -40,23 +22,22 @@ class SentenceFeatureBuilder(nn.Module):
 
         self.feature_list = feature_list
 
-        # 没有特征就直接关掉
         if len(self.feature_list) == 0:
             self.d_feat = 0
             self.mlp = None
             return
 
-        # roles embedding 维度
+        # roles embedding
         self.use_roles = "roles" in self.feature_list
         in_dim = 0
 
         if self.use_roles:
-            self.num_roles = len(ROLE2ID)   # 根据 TIAGE 的角色字典自动确定
+            self.num_roles = len(ROLE2ID)
             self.role_dim = 8
             self.role_emb = nn.Embedding(self.num_roles, self.role_dim)
             in_dim += self.role_dim
 
-        # 标量类 feature
+        # feature
         self.use_sent_len            = "sent_len"            in self.feature_list
         self.use_position            = "position"            in self.feature_list
         self.use_speaker_change      = "speaker_change"      in self.feature_list
@@ -84,13 +65,11 @@ class SentenceFeatureBuilder(nn.Module):
 
     def get_dim(self):
         return self.d_feat
-
-    # ====== 每个 feature 一个小函数 ======
-
+    
+    # ====== feature functions ======
     def _feat_roles(self, meta):
         roles = meta.get("roles", None)
         if roles is None:
-            # 用 sent_len 推 B,K，然后造一个 0 填充的 roles
             device = next(self.parameters()).device
             ref = meta.get("sent_len", None)
             if ref is None:
@@ -135,10 +114,6 @@ class SentenceFeatureBuilder(nn.Module):
     # ====== forward ======
 
     def forward(self, batch_meta, sent_mask):
-        """
-        batch_meta: dict，包含 roles/sent_len/position 以及选中的其它特征
-        sent_mask: (B, K)
-        """
         if self.d_feat == 0 or self.mlp is None or len(self.feature_list) == 0:
             return None
 

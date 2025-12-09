@@ -9,14 +9,10 @@ class HFEncoder(nn.Module):
         self.model = AutoModel.from_pretrained(model_name)
         self.hidden_size = self.model.config.hidden_size
         self._freeze_layers(unfreeze_top)
-        # 注意力池化头：给每个 token 打一个分数
         self.sent_pool = nn.Linear(self.hidden_size, 1)
 
     @staticmethod
     def _get_transformer_layers(model):
-        """
-        通用地拿到 encoder 的 block 列表，兼容 Roberta / DeBERTa / BART 等
-        """
         # Roberta / BERT: model.encoder.layer
         if hasattr(model, "encoder") and hasattr(model.encoder, "layer"):
             return model.encoder.layer
@@ -37,34 +33,23 @@ class HFEncoder(nn.Module):
         ):
             return model.model.encoder.layers
 
-        # 找不到就返回 None
         return None
 
         
     def _freeze_layers(self, unfreeze_top):
-        """
-        unfreeze_top 语义：
-          - -1: 全部解冻（不冻结）
-          - 0: 全部冻结（只训练后面的分类头）
-          - >0: 解冻最后 N 层 encoder block
-        """
         layers = self._get_transformer_layers(self.model)
 
-        # 先全部冻结
         for p in self.model.parameters():
             p.requires_grad = False
 
-        # -1 表示全部解冻
         if unfreeze_top == -1:
             for p in self.model.parameters():
                 p.requires_grad = True
             return
 
-        # 没找到层，或者 unfreeze_top == 0，就保持全冻结
         if layers is None or unfreeze_top <= 0:
             return
 
-        # 解冻最后 N 层
         total = len(layers)
         keep_from = max(0, total - unfreeze_top)
         for i, block in enumerate(layers):
@@ -72,7 +57,6 @@ class HFEncoder(nn.Module):
                 for p in block.parameters():
                     p.requires_grad = True
 
-        # 如果有一些最终的 LayerNorm / pooler，可以顺带解冻（可选）
         for attr in ["layernorm", "LayerNorm", "ln_f", "final_layer_norm", "pooler"]:
             mod = getattr(self.model, attr, None)
             if mod is not None:
@@ -105,9 +89,6 @@ def mean_pool_by_spans(
     max_K=None,
     sent_pool=None,
 ):
-    """
-    现在这个函数只做注意力池化（如果 sent_pool 为 None 会报错，正常情况总是传 self.sent_pool 进来）
-    """
     B, L, hidden_size = token_hidden.size()
 
     if max_K is None:
@@ -148,22 +129,18 @@ def mean_pool_by_spans(
 
             vecs = token_hidden[b, start:end, :]  # (len, H)
 
-            # 1. 每个 token 一个 score: (len,)
             scores = sent_pool(vecs).squeeze(-1)  # (len,)
 
-            # 2. 如果有 attention_mask，就把 padding 的位置屏蔽掉
             if attention_mask is not None:
                 am = attention_mask[b, start:end]  # (len,)
                 am = am.float()
                 if am.sum().item() == 0:
-                    # 这一句实际上没有有效 token，跳过，保持 mask=0
                     continue
                 scores = scores.masked_fill(am < 0.5, float("-inf"))
 
-            # 3. softmax 得到权重
+            # softmax
             weights = torch.softmax(scores, dim=0)    # (len,)
 
-            # 4. 加权求和得到句向量
             pooled = (vecs * weights.unsqueeze(-1)).sum(dim=0)  # (H,)
 
             H[b, k, :] = pooled

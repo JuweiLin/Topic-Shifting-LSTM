@@ -13,7 +13,8 @@ from feature import SentenceFeatureBuilder
 from classifier import SentenceShiftClassifier
 import config
 from evaluation import compute_loss, evaluate
-
+import os
+import json
 
 def set_seed(seed):
     torch.manual_seed(seed)
@@ -71,7 +72,6 @@ def train_one_epoch(
             
         logits_all = classifier(H, sent_mask_enc, F=feat_out) 
 
-        # 切片：忽略第0句
         logits_edge = logits_all[:, 1:]        
         labels_edge = labels[:, 1:]            
         sent_mask_edge = sent_mask_enc[:, 1:]  
@@ -103,7 +103,8 @@ def train_one_epoch(
 
 def main():
     set_seed(config.SEED)
-
+    ckpt_path = getattr(config, "BEST_MODEL_PATH", "ckpt_tiage_roberta_best.pt")
+    log_path  = getattr(config, "TRAIN_LOG_PATH", "train_log_tiage.jsonl")
     if torch.cuda.is_available():
         device = torch.device("cuda")
     elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
@@ -115,23 +116,21 @@ def main():
 
     tokenizer = AutoTokenizer.from_pretrained(config.ENCODER_NAME, use_fast=True)
 
-    # 保证 SENT_TOKEN 在 vocab 里（用于句子边界）
     if hasattr(config, "SENT_TOKEN") and config.SENT_TOKEN not in tokenizer.get_vocab():
         tokenizer.add_special_tokens({"additional_special_tokens": [config.SENT_TOKEN]})
         print(f"Added SENT_TOKEN '{config.SENT_TOKEN}' to tokenizer.")
 
 
     train_loader = build_dataloader(
-        [config.TRAIN_PATH, config.TEST_PATH],   # 这里传 list
+        [config.TRAIN_PATH, config.TEST_PATH],
         tokenizer,
         batch_size_dialog=config.BATCH_SIZE_DIALOG,
         shuffle=True,
         num_workers=config.NUM_WORKERS,
     )
 
-    # 2) 验证：用 test 当 dev
     dev_loader = build_dataloader(
-        config.DEV_PATH,                      # 用 test.json 做验证
+        config.DEV_PATH,
         tokenizer,
         batch_size_dialog=config.BATCH_SIZE_DIALOG,
         shuffle=False,
@@ -142,7 +141,6 @@ def main():
         model_name=config.ENCODER_NAME,
         unfreeze_top=config.UNFREEZE_TOP,
     ).to(device)
-    # 如果 tokenizer vocab 大小变了，扩展 encoder 的词表
     if hasattr(encoder, "model") and hasattr(encoder.model, "resize_token_embeddings"):
         encoder.model.resize_token_embeddings(len(tokenizer))
         print("Resized token embeddings to", len(tokenizer))
@@ -181,14 +179,13 @@ def main():
         weight_decay=config.WEIGHT_DECAY,
     )
 
-    # 处理 POS_WEIGHT 为 None 的情况
     if config.POS_WEIGHT is not None:
         pos_weight = torch.tensor(config.POS_WEIGHT, device=device)
         print(f"Using POS_WEIGHT: {config.POS_WEIGHT}")
     else:
         pos_weight = None
         print("Using NO POS_WEIGHT (Standard BCE)")
-
+    best_f1 = -1.0
     for epoch in range(config.EPOCHS):
         print("=== Epoch", epoch, "===")
         train_loss = train_one_epoch(
@@ -212,7 +209,36 @@ def main():
             device,
         )
         print("dev metrics:", metrics)
+        log_record = {
+            "epoch": epoch,
+            "train_loss": float(train_loss),
+            "dev_metrics": {k: float(v) if isinstance(v, (int, float)) else v
+                            for k, v in metrics.items()},
+        }
+        try:
+            with open(log_path, "a", encoding="utf-8") as f:
+                f.write(json.dumps(log_record, ensure_ascii=False) + "\n")
+        except Exception as e:
+            print(f"[WARN] Failed to write log to {log_path}: {e}")
 
+        # save best model
+        cur_f1 = metrics.get("f1_best", metrics.get("f1", 0.0))
+        if cur_f1 > best_f1:
+            best_f1 = cur_f1
+            print(f"[CKPT] New best f1_best={best_f1:.4f}, saving model to {ckpt_path}")
+
+            os.makedirs(os.path.dirname(ckpt_path) or ".", exist_ok=True)
+            torch.save(
+                {
+                    "epoch": epoch,
+                    "best_f1": best_f1,
+                    "encoder_state": encoder.state_dict(),
+                    "feat_state": feat_builder.state_dict(),
+                    "clf_state": classifier.state_dict(),
+                    "config": {k: getattr(config, k) for k in dir(config) if k.isupper()},
+                },
+                ckpt_path,
+            )
 
 if __name__ == "__main__":
     main()
